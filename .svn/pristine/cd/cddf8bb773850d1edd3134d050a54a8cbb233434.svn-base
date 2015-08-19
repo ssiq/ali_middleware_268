@@ -1,0 +1,237 @@
+package com.alibaba.middleware.race.mom.store.queue;
+
+import com.alibaba.middleware.race.mom.Message;
+import com.alibaba.middleware.race.mom.model.IndexMessage;
+import com.alibaba.middleware.race.mom.serializer.Serializer;
+import com.alibaba.middleware.race.mom.util.NameCreater;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.channels.FileChannel;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerArray;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * Created by wlw on 15-8-11.
+ *
+ * flag(4字节)+length(4字节)+body+endInt(4字节)
+ */
+public class MessageBlockQueue extends LengthFieldQueue {
+
+    private FileChannel fileChannel;
+    private AtomicIntegerArray indexArray;
+
+    public MessageBlockQueue(String fileName,int fileLength,ConcurrentMap<String, IndexMessage> msgMap){
+        this.fileName=fileName;
+        this.fileLength=fileLength;
+        this.msgMap=msgMap;
+    }
+
+    public void start() throws IOException
+    {
+        File file=new File(fileName);
+        if(!file.exists())
+        {
+            isNew=true;
+        }
+        randomAccessFile=new RandomAccessFile(fileName,"rw");
+        if(isNew)
+        {
+            randomAccessFile.setLength(fileLength);
+        }
+        fileChannel=randomAccessFile.getChannel();
+        mappedByteBuffer=fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, fileChannel.size());
+//        mappedByteBuffer.load();
+        this.fileLength=(int)fileChannel.size();
+        if(!isNew)
+        {
+
+        }
+        haveStarted();
+    }
+
+    private ConcurrentMap<String, IndexMessage> msgMap;
+
+    private static class MessageBlockQueueFactory implements QueueFactory
+    {
+
+        private int fileLength;
+        private ConcurrentMap<String, IndexMessage> msgMap;
+
+        public MessageBlockQueueFactory(int fileLength,ConcurrentMap<String, IndexMessage> msgMap) {
+            this.fileLength = fileLength;
+            this.msgMap=msgMap;
+        }
+
+        @Override
+        public Object getNewQueue(String name) {
+            return new MessageBlockQueue(name,fileLength,msgMap);
+        }
+    }
+
+    public static QueueFactory getFactory(int fileLength,ConcurrentMap<String, IndexMessage> msgMap)
+    {
+        return new MessageBlockQueueFactory(fileLength,msgMap);
+    }
+
+    private class InnerIndexMessage implements IndexMessage
+    {
+//        private String msgId;
+        private int index;
+        private MessageQueue messageQueue;
+        private AtomicBoolean isUsedBool=new AtomicBoolean(false);
+
+        public InnerIndexMessage(int index,MessageQueue messageQueue) {
+//            this.msgId = msgId;
+            this.messageQueue=messageQueue;
+            this.index = index;
+        }
+
+//        @Override
+//        public void setUse() {
+//            this.messageQueue.remove(index);
+//            this.messageQueue.pop();
+//        }
+
+        @Override
+        public boolean isUsed() {
+            return this.isUsedBool.get();
+        }
+
+        @Override
+        public byte[] getMessage() {
+            return this.messageQueue.get(index);
+        }
+
+//        @Override
+//        public String getMsgId() {
+//            return null;
+////            return msgId;
+//        }
+
+        private void setUsed()
+        {
+            this.isUsedBool.set(true);
+            this.messageQueue.remove(this.index);
+            this.messageQueue.pop();
+        }
+
+        private AtomicInteger leftToSend=new AtomicInteger(0);
+        private AtomicBoolean end=new AtomicBoolean(false);
+        @Override
+        public void up() {
+            leftToSend.incrementAndGet();
+        }
+
+        @Override
+        public void down() {
+            if(this.leftToSend.decrementAndGet()==0&&this.end.get())
+            {
+                this.setUsed();
+            }
+        }
+
+        @Override
+        public void downOnce(AtomicBoolean once) {
+            if(once.get()||!once.compareAndSet(false,true))return;
+            this.down();
+        }
+
+        @Override
+        public void endUp() {
+            this.end.set(true);
+            if(this.leftToSend.get()==0)
+            {
+                this.setUsed();
+            }
+        }
+
+//        @Override
+//        public String getPutQueueName() {
+//            return null;
+//        }
+    }
+
+    public IndexMessage putMessage(Message message,byte[] messagebyte)
+    {
+        Serializer serializer=Serializer.getMessageSerialier();
+//        byte[] bytes=serializer.encode(message);
+        int res=add(messagebyte);
+        if(res==-1)
+        {
+            return null;
+        }else{
+            IndexMessage indexMessage=new InnerIndexMessage(res,this);
+//            msgMap.put(message.getMsgId(),indexMessage);
+            return indexMessage;
+        }
+    }
+
+    public void force()
+    {
+        sem.await();
+        doForceAction();
+    }
+
+//    private CountDownLatch hasNext=new CountDownLatch(1);
+    private MessageBlockQueue next=null;
+    private Lock lock=new ReentrantLock();
+    public MessageBlockQueue getNewQueue(String path) {
+        try
+        {
+            lock.lock();
+            if(next==null)
+            {
+                int tryTime=10;
+                while (tryTime>0)
+                {
+                    next=new MessageBlockQueue(path+ NameCreater.newName(),fileLength,msgMap);
+                    try {
+                        next.start();
+//                        System.out.println("success get next queue");
+//                        hasNext.countDown();
+                        return next;
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                    --tryTime;
+                    System.out.println("get next queue fail");
+                }
+                next=null;
+                return this;
+            }
+        }finally {
+            lock.unlock();
+        }
+        return next;
+    }
+
+    public MessageBlockQueue getNext(String path) {
+//        while (true)
+//        {
+//            try {
+//                if(hasNext.await(300, TimeUnit.MILLISECONDS))
+//                {
+//                    return next;
+//                }
+//                break;
+//            } catch (InterruptedException e) {
+//                e.printStackTrace();
+//            }
+//        }
+        if(!isFull())return this;
+//        System.out.println("id "+id+" get next queue");
+        if(next!=null)return next;
+        return getNewQueue(path);
+    }
+    public int getId()
+    {
+        return id;
+    }
+}

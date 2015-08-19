@@ -1,0 +1,360 @@
+package com.alibaba.middleware.race.mom.broker;
+
+import com.alibaba.middleware.race.mom.*;
+import com.alibaba.middleware.race.mom.error.AsyncInvokeTooQuickException;
+import com.alibaba.middleware.race.mom.message.TopicManager;
+import com.alibaba.middleware.race.mom.model.*;
+import com.alibaba.middleware.race.mom.serializer.Serializer;
+import com.alibaba.middleware.race.mom.service.AbstractRequestService;
+import com.alibaba.middleware.race.mom.service.Pair;
+import com.alibaba.middleware.race.mom.store.MessageStore;
+import com.alibaba.middleware.race.mom.util.Sem;
+import com.alibaba.middleware.race.mom.util.SimpleQueue;
+import com.alibaba.middleware.race.mom.util.WrapConcurrentListQueue;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+
+import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Created by wlw on 15-8-5.
+ */
+public class PostMessageRequstService extends AbstractRequestService {
+
+    private InvokeInterface invokeInterface;
+    private TopicManager<GroupChannel> channelTopicManager;
+    private Serializer messageSerializer=Serializer.getMessageSerialier();
+    private Serializer consumerResultSerializer=Serializer.getConsumnerResultSerialier();
+    private Serializer sendResultSerializer=Serializer.getSendResultSerialier();
+    private MessageId messageId;
+    private MessageStore messageStore;
+    private ExecutorService executorService;
+//    private ConcurrentLinkedQueue<Pair<GroupChannel,IndexMessage>> unsendQueue;
+    private SimpleQueue<Pair<GroupChannel,IndexMessage>> unsendQueue;
+    private SimpleQueue<PostMessage> preForcedQueue=new WrapConcurrentListQueue<PostMessage>(
+            new ConcurrentLinkedQueue<PostMessage>());
+    private InnerRunnableFactory runableFactory;
+
+    private void doCacheResponse(ChannelHandlerContext ctx,TransmittingMessage response)
+    {
+        ctx.writeAndFlush(response);
+    }
+
+    private class InnerRunnableFactory implements RunnableFactory
+    {
+        private AtomicInteger sendTimes=new AtomicInteger(0);
+        private Runnable getPostRunabble(final PostMessage postMessage, final Sem sem)
+        {
+            return new Runnable() {
+                @Override
+                public void run() {
+//                    sem.up();
+//                    long t=System.currentTimeMillis();
+                    doCacheResponse(postMessage.getCtx(), postMessage.getPostResponse());
+//                    System.out.println("resend time:"+(System.currentTimeMillis()-t));
+//                    System.out.println("send times:"+sendTimes.incrementAndGet());
+
+                    List<GroupChannel> list=postMessage.getList();
+                    if(!list.isEmpty()){
+                        Iterator<GroupChannel> groupChannelIterator=list.iterator();
+                        final IndexMessage indexMessage=postMessage.getIndexMessage();
+                        final TransmittingMessage sendMessage=postMessage.getBroadRequest();
+                        while (groupChannelIterator.hasNext())
+                        {
+                            final GroupChannel groupChannel=groupChannelIterator.next();
+                            Channel channel=groupChannel.getNowChannel();
+                            indexMessage.up();
+                            if(channel==null)
+                            {
+                                registerUnSend(groupChannel, indexMessage);
+                                System.out.println("broad one fail");
+                            }else{
+                                try {
+                                    invokeInterface.invokeAsync(channel, sendMessage, new CallbackListener() {
+                                        @Override
+                                        public void invoke(ResponseFuture responseFuture) {
+                                            if(!responseFuture.isOK())
+                                            {
+                                                //this part should add code to register the message don't send out it should wait
+                                                registerUnSend(groupChannel,indexMessage);
+                                                System.out.println("broad one fail");
+                                            }else{
+                                                TransmittingMessage response=responseFuture.getTransmittingMessage();
+                                                ConsumeResult consumeResult=new ConsumeResult();
+                                                consumerResultSerializer.decode(response.getBody(), consumeResult);
+                                                if(consumeResult.getStatus()== ConsumeStatus.FAIL)
+                                                {
+                                                    //this part should add code to register the message don't send out it should wait
+                                                    registerUnSend(groupChannel,indexMessage);
+                                                    System.out.println("broad one fail");
+                                                }else{
+                                                    indexMessage.down();
+//                                                System.out.println("broad one success");
+                                                }
+                                            }
+                                        }
+                                    });
+                                } catch (InterruptedException | AsyncInvokeTooQuickException e) {
+                                    e.printStackTrace();
+                                    registerUnSend(groupChannel,indexMessage);
+                                }
+                            }
+
+//                System.out.println("broad one");
+                        }
+                        indexMessage.endUp();
+                    }else{
+                        //run into the part means there is no consumer which registers the topic
+                        System.out.println("no one subscript");
+                    }
+//                    sem.down();
+                }
+            };
+        }
+
+        private Serializer sendResultSerialier=Serializer.getSendResultSerialier();
+        private AtomicInteger no=new AtomicInteger(0);
+
+        public Pair<Runnable,Runnable> snapshot()
+        {
+            final int size=preForcedQueue.size();
+            final AtomicInteger canDo=new AtomicInteger(size);
+            final AtomicInteger doneNumber=new AtomicInteger(0);
+            final ConcurrentLinkedQueue<PostMessage> afterQueue=new ConcurrentLinkedQueue<>();
+            final int number=no.incrementAndGet();
+            Runnable beforeForce=new Runnable() {
+                @Override
+                public void run() {
+                    int cores=Runtime.getRuntime().availableProcessors();
+//                    System.out.println("cores:"+cores);
+                    for(int i=0;i<cores;++i)
+                    {
+                        final int finalI = i;
+                        executorService.submit(new Runnable() {
+                            @Override
+                            public void run() {
+                                System.out.println(""+number+" "+ finalI +"begin");
+                                while (canDo.decrementAndGet()>=0)
+                                {
+                                    PostMessage postMessage=preForcedQueue.get();
+                                    try{
+
+                                        List<GroupChannel> list=channelTopicManager.filterByMessage(postMessage.getMessage());
+                                        postMessage.setList(list);
+
+                                        SendResult sendResult=new SendResult();
+                                        Message message=postMessage.getMessage();
+                                        sendResult.setMsgId(message.getMsgId());
+                                        sendResult.setStatus(SendStatus.SUCCESS);
+                                        byte[]sendResultBytes=sendResultSerialier.encode(sendResult);
+                                        TransmittingMessage response=TransmittingMessage.wrapResponseMessage(
+                                                MessageConst.getPOSTRESULT(),sendResultBytes);
+                                        response.setOpaque(postMessage.getRequeset().getOpaque());
+                                        response.preEncode();
+                                        postMessage.setPostResponse(response);
+
+                                        TransmittingMessage broadRequest=TransmittingMessage.wrapRequestMessage(
+                                                MessageConst.getBROAD(),postMessage.getMessageByte());
+                                        broadRequest.preEncode();
+                                        postMessage.setBroadRequest(broadRequest);
+                                        afterQueue.add(postMessage);
+                                    }catch (Throwable t) {
+                                        t.printStackTrace();
+                                    }finally {
+                                        doneNumber.incrementAndGet();
+                                    }
+                                }
+                                System.out.println(""+number+" "+ finalI +"end");
+                            }
+                        });
+                    }
+                }
+            };
+
+            Runnable endForce=new Runnable() {
+                @Override
+                public void run() {
+                    AtomicInteger atomicInteger=new AtomicInteger(0);
+//                    Sem sem=new Sem();
+                    long t=System.currentTimeMillis();
+                    while (doneNumber.get()<size)
+                    {
+                        System.out.println("delay "+number+" one: "+doneNumber.get()+" size:"+size +" cando:"+canDo.get());
+                        PostMessage postMessage=afterQueue.poll();
+                        while (postMessage!=null)
+                        {
+                            executorService.submit(getPostRunabble(postMessage,null));
+                            atomicInteger.incrementAndGet();
+                            postMessage=afterQueue.poll();
+                        }
+                    }
+
+                    PostMessage postMessage=afterQueue.poll();
+                    while (postMessage!=null)
+                    {
+                        executorService.submit(getPostRunabble(postMessage,null));
+                        atomicInteger.incrementAndGet();
+                        postMessage=afterQueue.poll();
+                    }
+//                    sem.end();
+//                    sem.await();
+//                    System.out.println("all send need:"+(System.currentTimeMillis()-t));
+//                    System.out.println("send threads:"+atomicInteger.get());
+                }
+            };
+
+            return new Pair<>(beforeForce,endForce);
+        }
+    }
+
+    public PostMessageRequstService(InvokeInterface invokeInterface,
+                                    MessageId messageId,
+                                    ExecutorService executorService,
+                                    SimpleQueue<Pair<GroupChannel,IndexMessage>> unsendQueue) {
+        this.invokeInterface = invokeInterface;
+        this.messageId=messageId;
+        this.executorService=executorService;
+        this.unsendQueue=unsendQueue;
+        this.runableFactory=new InnerRunnableFactory();
+    }
+
+    public void setChannelTopicManager(TopicManager<GroupChannel> channelTopicManager) {
+        this.channelTopicManager = channelTopicManager;
+    }
+
+    public void setMessageStore(MessageStore messageStore) {
+        this.messageStore = messageStore;
+    }
+
+    private void registerUnSend(GroupChannel groupChannel,IndexMessage indexMessage)
+    {
+//        indexMessage.up();
+        unsendQueue.put(new Pair<GroupChannel, IndexMessage>(groupChannel, indexMessage));
+    }
+
+    @Override
+    public void process(ChannelHandlerContext ctx, final TransmittingMessage transmittingMessage) {
+//        System.out.println("get producer post");
+        final Message message=new Message();
+        messageSerializer.decode(transmittingMessage.getBody(), message);
+        message.setMsgId(messageId.getMessageId());
+
+        final byte[] messageByte=messageSerializer.encode(message);
+
+        //this part should add code to add the message into the disk
+
+        long time=System.currentTimeMillis();
+        IndexMessage indexMessage=messageStore.storeMessage(message,messageByte);
+        SendResult sendResult=new SendResult();
+        sendResult.setMsgId(message.getMsgId());
+        if(indexMessage==null)
+        {
+            sendResult.setStatus(SendStatus.FAIL);
+            TransmittingMessage response=TransmittingMessage.wrapResponseMessage(MessageConst.getPOSTRESULT(),
+                    sendResultSerializer.encode(sendResult));
+            doResponse(ctx,transmittingMessage,response);
+        }else{
+            preForcedQueue.put(new PostMessage(message,messageByte,ctx,transmittingMessage,indexMessage));
+        }
+
+        messageStore.force();
+//        System.out.println("send result:");
+//        System.out.println("transmitting:" + transmittingMessage.toString());
+//        System.out.println("result:"+sendResult.toString());
+
+//        while (true)
+//        {
+//            try {
+//                countDownLatch.await();
+////                System.out.println("await now");
+//                break;
+//            } catch (InterruptedException e) {
+//                e.printStackTrace();
+//            }
+//        }
+//        System.out.println("await time:"+(System.currentTimeMillis()-time));
+
+        //异步发送消息
+//        Runnable runnable=new Runnable() {
+//            @Override
+//            public void run() {
+//                List<GroupChannel> list=channelTopicManager.filterByMessage(message);
+////                final AtomicBoolean oneSendFail = new AtomicBoolean(false);
+////                final Sem sem=new Sem();
+////                System.out.println("begin broad message");
+//                if(!list.isEmpty())
+//                {
+//                    Iterator<GroupChannel> groupChannelIterator=list.iterator();
+//                    TransmittingMessage sendMessage=TransmittingMessage.wrapRequestMessage(
+//                            MessageConst.getBROAD(), messageByte);
+//                    while (groupChannelIterator.hasNext())
+//                    {
+//                        final GroupChannel groupChannel=groupChannelIterator.next();
+//                        Channel channel=groupChannel.getNowChannel();
+////                        sem.up();
+//                        indexMessage.up();
+////                        AtomicBoolean downOnce=new AtomicBoolean(false);
+//                        if(channel==null)
+//                        {
+////                            oneSendFail.set(false);
+//                            registerUnSend(groupChannel, indexMessage);
+//                            System.out.println("broad one fail");
+////                            sem.down();
+//                        }else{
+//                            try {
+//                                invokeInterface.invokeAsync(channel, sendMessage, new CallbackListener() {
+//                                    @Override
+//                                    public void invoke(ResponseFuture responseFuture) {
+//                                        if(!responseFuture.isOK())
+//                                        {
+//                                            //this part should add code to register the message don't send out it should wait
+////                                            oneSendFail.set(true);
+//                                            registerUnSend(groupChannel,indexMessage);
+//                                            System.out.println("broad one fail");
+//                                        }else{
+//                                            ConsumeResult consumeResult=new ConsumeResult();
+//                                            consumerResultSerializer.decode(transmittingMessage.getBody(), consumeResult);
+//                                            if(consumeResult.getStatus()== ConsumeStatus.FAIL)
+//                                            {
+//                                                //this part should add code to register the message don't send out it should wait
+////                                                oneSendFail.set(true);
+//                                                registerUnSend(groupChannel,indexMessage);
+//                                                System.out.println("broad one fail");
+//                                            }else{
+//                                                indexMessage.down();
+////                                                System.out.println("broad one success");
+//                                            }
+//                                        }
+////                                        sem.down();
+//                                    }
+//                                });
+//                            } catch (InterruptedException | AsyncInvokeTooQuickException e) {
+//                                e.printStackTrace();
+////                                oneSendFail.set(true);
+////                                sem.down();
+//                                registerUnSend(groupChannel,indexMessage);
+//                            }
+//                        }
+//
+////                System.out.println("broad one");
+//                    }
+//                }else{
+//                    //run into the part means there is no consumer which registers the topic
+//                    System.out.println("no one subscript");
+//                }
+//
+//                indexMessage.endUp();
+//            }
+//        };
+//        executorService.submit(runnable);
+    }
+
+    public RunnableFactory getRunableFactory() {
+        return runableFactory;
+    }
+}

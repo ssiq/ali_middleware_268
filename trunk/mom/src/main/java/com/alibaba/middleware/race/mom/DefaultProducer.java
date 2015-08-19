@@ -1,0 +1,131 @@
+package com.alibaba.middleware.race.mom;
+
+import com.alibaba.middleware.race.mom.consumer.ReceiveRequestService;
+import com.alibaba.middleware.race.mom.error.AsyncInvokeTooQuickException;
+import com.alibaba.middleware.race.mom.error.InvokeFailException;
+import com.alibaba.middleware.race.mom.error.RemoteRunOuttimeException;
+import com.alibaba.middleware.race.mom.model.CallbackListener;
+import com.alibaba.middleware.race.mom.model.MessageConst;
+import com.alibaba.middleware.race.mom.model.ResponseFuture;
+import com.alibaba.middleware.race.mom.model.TransmittingMessage;
+import com.alibaba.middleware.race.mom.serializer.Serializer;
+import com.alibaba.middleware.race.mom.service.Client;
+
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Created by wlw on 15-8-2.
+ */
+public class DefaultProducer implements Producer {
+
+    private String topic;
+    private String groupId;
+    private Client client;
+    private Serializer messageSerilizer=Serializer.getMessageSerialier();
+    private Serializer sendResultSerialier =Serializer.getSendResultSerialier();
+    private String ip;
+
+    private void sleep(int time) {
+        try {
+            Thread.sleep(time);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void start() {
+        ip=System.getProperty("SIP");
+        long timeout=30000000;
+        int asyncpermit=300;
+        client=new Client(asyncpermit,timeout);
+        int port=9999;
+        while (true)
+        {
+            try {
+                client.connect(ip,port,null);
+                break;
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+                this.sleep(3000);
+            }
+        }
+    }
+
+    @Override
+    public void setTopic(String topic) {
+        this.topic=topic;
+    }
+
+    @Override
+    public void setGroupId(String groupId) {
+        this.groupId=groupId;
+    }
+
+//    private AtomicInteger sendNumber=new AtomicInteger(0);
+//    private AtomicInteger receiveNumber=new AtomicInteger(0);
+    @Override
+    public SendResult sendMessage(Message message) {
+//        System.out.println("send message "+sendNumber.incrementAndGet());
+        message.setBornTime(System.currentTimeMillis());
+        message.setTopic(topic);
+        TransmittingMessage transmittingMessage=TransmittingMessage.wrapRequestMessage(
+                MessageConst.getPOST(),
+                messageSerilizer.encode(message)
+        );
+        SendResult sendResult=new SendResult();
+        try {
+            TransmittingMessage response=client.doSyncInvoke(ip,transmittingMessage);
+            sendResultSerialier.decode(response.getBody(),sendResult);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        } catch (InvokeFailException e) {
+            e.printStackTrace();
+            sendResult.setStatus(SendStatus.FAIL);
+        } catch (RemoteRunOuttimeException e) {
+            e.printStackTrace();
+            sendResult.setStatus(SendStatus.FAIL);
+        }
+//        System.out.println("receive message "+receiveNumber.incrementAndGet());
+        return sendResult;
+    }
+
+    @Override
+    public void asyncSendMessage(Message message, final SendCallback callback) {
+        message.setBornTime(System.currentTimeMillis());
+        message.setTopic(topic);
+        TransmittingMessage transmittingMessage=TransmittingMessage.wrapRequestMessage(
+                MessageConst.getPOST(),
+                messageSerilizer.encode(message)
+        );
+        try {
+            client.doAsyncInvoke(ip, transmittingMessage, new CallbackListener() {
+                @Override
+                public void invoke(ResponseFuture responseFuture) {
+                    TransmittingMessage response=responseFuture.getTransmittingMessage();
+                    SendResult sendResult=new SendResult();
+                    sendResultSerialier.decode(response.getBody(),sendResult);
+                    callback.onResult(sendResult);
+                    if(responseFuture.isOK())
+                    {
+                        sendResult.setStatus(SendStatus.SUCCESS);
+                    }else{
+                        sendResult.setStatus(SendStatus.FAIL);
+                    }
+                }
+            });
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        } catch (AsyncInvokeTooQuickException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void stop() {
+        client.shutdown();
+    }
+}
